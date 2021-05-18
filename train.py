@@ -5,86 +5,96 @@ Beispiel Code und  Spielwiese
 """
 
 
-import csv
-import scipy.io as sio
-import matplotlib.pyplot as plt
+from __future__ import print_function
+from __future__ import division
+from __future__ import absolute_import
+
+import argparse
+import json
+import keras
 import numpy as np
-from ecgdetectors import Detectors
 import os
-from wettbewerb import load_references
+import random
+import time
 
-### if __name__ == '__main__':  # bei multiprocessing auf Windows notwendig
+import network
+import load
+import util
 
-ecg_leads,ecg_labels,fs,ecg_names = load_references() # Importiere EKG-Dateien, zugehörige Diagnose, Sampling-Frequenz (Hz) und Name                                                # Sampling-Frequenz 300 Hz
+MAX_EPOCHS = 100
 
-detectors = Detectors(fs)                                 # Initialisierung des QRS-Detektors
-sdnn_normal = np.array([])                                # Initialisierung der Feature-Arrays
-sdnn_afib = np.array([])
-for idx, ecg_lead in enumerate(ecg_leads):
-    r_peaks = detectors.hamilton_detector(ecg_lead)     # Detektion der QRS-Komplexe
-    sdnn = np.std(np.diff(r_peaks)/fs*1000)             # Berechnung der Standardabweichung der Schlag-zu-Schlag Intervalle (SDNN) in Millisekunden
-    if ecg_labels[idx]=='N':
-      sdnn_normal = np.append(sdnn_normal,sdnn)         # Zuordnung zu "Normal"
-    if ecg_labels[idx]=='A':
-      sdnn_afib = np.append(sdnn_afib,sdnn)             # Zuordnung zu "Vorhofflimmern"
-    if (idx % 100)==0:
-      print(str(idx) + "\t EKG Signale wurden verarbeitet.")
+def make_save_dir(dirname, experiment_name):
+    start_time = str(int(time.time())) + '-' + str(random.randrange(1000))
+    save_dir = os.path.join(dirname, experiment_name, start_time)
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    return save_dir
 
-fig, axs = plt.subplots(2,1, constrained_layout=True)
-axs[0].hist(sdnn_normal,2000)
-axs[0].set_xlim([0, 300])
-axs[0].set_title("Normal")
-axs[0].set_xlabel("SDNN (ms)")
-axs[0].set_ylabel("Anzahl")
-axs[1].hist(sdnn_afib,300)
-axs[1].set_xlim([0, 300])
-axs[1].set_title("Vorhofflimmern")
-axs[1].set_xlabel("SDNN (ms)")
-axs[1].set_ylabel("Anzahl")
-plt.show()
+def get_filename_for_saving(save_dir):
+    return os.path.join(save_dir,
+            "{val_loss:.3f}-{val_acc:.3f}-{epoch:03d}-{loss:.3f}-{acc:.3f}.hdf5")
 
-sdnn_total = np.append(sdnn_normal,sdnn_afib) # Kombination der beiden SDNN-Listen
-p05 = np.nanpercentile(sdnn_total,5)          # untere Schwelle
-p95 = np.nanpercentile(sdnn_total,95)         # obere Schwelle
-thresholds = np.linspace(p05, p95, num=20)    # Liste aller möglichen Schwellwerte
-F1 = np.array([])
-for th in thresholds:
-  TP = np.sum(sdnn_afib>=th)                  # Richtig Positiv
-  TN = np.sum(sdnn_normal<th)                 # Richtig Negativ
-  FP = np.sum(sdnn_normal>=th)                # Falsch Positiv
-  FN = np.sum(sdnn_afib<th)                   # Falsch Negativ
-  F1 = np.append(F1, TP / (TP + 1/2*(FP+FN))) # Berechnung des F1-Scores
+def train(args, params):
 
-th_opt=thresholds[np.argmax(F1)]              # Bestimmung des Schwellwertes mit dem höchsten F1-Score
+    print("Loading training set...")
+    train = load.load_dataset(params['train'])
+    print("Loading dev set...")
+    dev = load.load_dataset(params['dev'])
+    print("Building preprocessor...")
+    preproc = load.Preproc(*train)
+    print("Training size: " + str(len(train[0])) + " examples.")
+    print("Dev size: " + str(len(dev[0])) + " examples.")
 
-if os.path.exists("model.npy"):
-    os.remove("model.npy")
-with open('model.npy', 'wb') as f:
-    np.save(f, th_opt)
 
-fig, ax = plt.subplots()
-ax.plot(thresholds,F1)
-ax.plot(th_opt,F1[np.argmax(F1)],'xr')
-ax.set_title("Schwellwert")
-ax.set_xlabel("SDNN (ms)")
-ax.set_ylabel("F1")
-plt.show()
+    save_dir = make_save_dir(params['save_dir'], args.experiment)
 
-fig, axs = plt.subplots(2,1, constrained_layout=True)
-axs[0].hist(sdnn_normal,2000)
-axs[0].set_xlim([0, 300])
-tmp = axs[0].get_ylim()
-axs[0].plot([th_opt,th_opt],[0,10000])
-axs[0].set_ylim(tmp)
-axs[0].set_title("Normal")
-axs[0].set_xlabel("SDNN (ms)")
-axs[0].set_ylabel("Anzahl")
-axs[1].hist(sdnn_afib,300)
-axs[1].set_xlim([0, 300])
-tmp = axs[1].get_ylim()
-axs[1].plot([th_opt,th_opt],[0,10000])
-axs[1].set_ylim(tmp)
-axs[1].set_title("Vorhofflimmern")
-axs[1].set_xlabel("SDNN (ms)")
-axs[1].set_ylabel("Anzahl")
-plt.show()
+    util.save(preproc, save_dir)
+
+    params.update({
+        "input_shape": [None, 1],
+        "num_categories": len(preproc.classes)
+    })
+
+    model = network.build_network(**params)
+
+    stopping = keras.callbacks.EarlyStopping(patience=8)
+
+    reduce_lr = keras.callbacks.ReduceLROnPlateau(
+        factor=0.1,
+        patience=2,
+        min_lr=params["learning_rate"] * 0.001)
+
+    checkpointer = keras.callbacks.ModelCheckpoint(
+        filepath=get_filename_for_saving(save_dir),
+        save_best_only=False)
+
+    batch_size = params.get("batch_size", 32)
+
+    if params.get("generator", False):
+        train_gen = load.data_generator(batch_size, preproc, *train)
+        dev_gen = load.data_generator(batch_size, preproc, *dev)
+        model.fit_generator(
+            train_gen,
+            steps_per_epoch=int(len(train[0]) / batch_size),
+            epochs=MAX_EPOCHS,
+            validation_data=dev_gen,
+            validation_steps=int(len(dev[0]) / batch_size),
+            callbacks=[checkpointer, reduce_lr, stopping])
+    else:
+        train_x, train_y = preproc.process(*train)
+        dev_x, dev_y = preproc.process(*dev)
+        model.fit(
+            train_x, train_y,
+            batch_size=batch_size,
+            epochs=MAX_EPOCHS,
+            validation_data=(dev_x, dev_y),
+            callbacks=[checkpointer, reduce_lr, stopping])
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("config_file", help="path to config file")
+    parser.add_argument("--experiment", "-e", help="tag with experiment name",
+                        default="default")
+    args = parser.parse_args()
+    params = json.load(open(args.config_file, 'r'))
+    train(args, params)
